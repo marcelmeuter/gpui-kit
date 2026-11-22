@@ -235,13 +235,20 @@ impl RenderOnce for Button {
             .when_some(self.accessibility_label, |this, label| {
                 this.aria_label(label)
             })
-            .when(!disabled && self.focusable, |this| {
-                this.track_focus(
-                    &focus_handle
-                        .tab_index(self.tab_index)
-                        .tab_stop(self.tab_stop),
-                )
-            })
+            // A command may disable itself while it owns focus (for example,
+            // during a save). Keep its dispatch ancestry until focus leaves so
+            // parent Escape/Tab actions still work. It cannot be activated or
+            // reached as a new Tab stop while disabled.
+            .when(
+                self.focusable && (!disabled || focus_handle.is_focused(window)),
+                |this| {
+                    this.track_focus(
+                        &focus_handle
+                            .tab_index(self.tab_index)
+                            .tab_stop(self.tab_stop && !disabled),
+                    )
+                },
+            )
             .when(disabled, |this| {
                 this.on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
@@ -381,6 +388,70 @@ mod tests {
 
         assert_eq!(button_clicks.get(), 0);
         assert_eq!(parent_clicks.get(), 0);
+    }
+
+    #[gpui::test]
+    fn disabling_focused_button_preserves_keyboard_navigation(cx: &mut TestAppContext) {
+        struct Form {
+            disabled: bool,
+            save: FocusHandle,
+            next: FocusHandle,
+            keys: Rc<Cell<usize>>,
+            clicks: Rc<Cell<usize>>,
+        }
+        impl Render for Form {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let keys = self.keys.clone();
+                let clicks = self.clicks.clone();
+                div()
+                    .tab_group()
+                    .on_key_down(move |event, window, cx| {
+                        keys.set(keys.get() + 1);
+                        if event.keystroke.key == "tab" {
+                            window.focus_next(cx);
+                        }
+                    })
+                    .child(
+                        Button::new("save")
+                            .track_focus(&self.save)
+                            .disabled(self.disabled)
+                            .child("Save")
+                            .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                    )
+                    .child(Button::new("next").track_focus(&self.next).child("Next"))
+            }
+        }
+        let keys = Rc::new(Cell::new(0));
+        let clicks = Rc::new(Cell::new(0));
+        let (form, cx) = cx.add_window_view({
+            let keys = keys.clone();
+            let clicks = clicks.clone();
+            move |_, cx| Form {
+                disabled: false,
+                save: cx.focus_handle(),
+                next: cx.focus_handle(),
+                keys,
+                clicks,
+            }
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let save = form.read(cx).save.clone();
+            save.focus(window, cx);
+        });
+        form.update(cx, |form, cx| {
+            form.disabled = true;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("escape enter tab");
+        assert_eq!(
+            keys.get(),
+            3,
+            "parent commands must remain reachable after Save disables itself"
+        );
+        assert_eq!(clicks.get(), 0, "disabled button must not activate");
+        cx.update(|window, cx| assert!(form.read(cx).next.is_focused(window)));
     }
 
     #[gpui::test]

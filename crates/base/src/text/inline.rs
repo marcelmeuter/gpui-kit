@@ -325,7 +325,9 @@ impl InlineState {
 
 /// The native lines and placement of a completed paint. `TextLayout::clone`
 /// shares mutable measurement state; these immutable shaped lines do not.
+#[derive(Clone)]
 struct PaintedSelectionLayout {
+    align: TextAlign,
     lines: smallvec::SmallVec<[Arc<gpui::WrappedLineLayout>; 1]>,
     bounds: Bounds<Pixels>,
     line_height: Pixels,
@@ -333,8 +335,14 @@ struct PaintedSelectionLayout {
 }
 
 impl PaintedSelectionLayout {
+    #[cfg(test)]
     fn new(layout: &TextLayout) -> Self {
+        Self::aligned(layout, TextAlign::Left)
+    }
+
+    fn aligned(layout: &TextLayout, align: TextAlign) -> Self {
         Self {
+            align,
             lines: layout.line_layouts(),
             bounds: layout.bounds(),
             line_height: layout.line_height(),
@@ -351,12 +359,58 @@ impl PaintedSelectionLayout {
                 break;
             }
             if index <= end {
-                return Some(origin + line.position_for_index(index - start, self.line_height)?);
+                let mut position = line.position_for_index(index - start, self.line_height)?;
+                let row = (position.y / self.line_height) as usize;
+                position.x += self.row_shift(line, row);
+                return Some(origin + position);
             }
             origin.y += line.size(self.line_height).height;
             start = end + 1;
         }
         None
+    }
+
+    fn row_shift(&self, line: &gpui::WrappedLineLayout, row: usize) -> Pixels {
+        let layout = &line.unwrapped_layout;
+        let boundary_x = |i: usize| {
+            let boundary = &line.wrap_boundaries[i];
+            layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                .position
+                .x
+        };
+        let start = if row == 0 {
+            px(0.)
+        } else {
+            boundary_x(row - 1)
+        };
+        let end = if row < line.wrap_boundaries.len() {
+            boundary_x(row)
+        } else {
+            layout.width
+        };
+        aligned_row_left(self.align, self.bounds.size.width, end - start)
+    }
+
+    fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
+        let mut local = position - self.bounds.origin;
+        let mut start = 0;
+        if local.y < px(0.) {
+            return Err(0);
+        }
+        for line in &self.lines {
+            let height = line.size(self.line_height).height;
+            if local.y < height {
+                let row = (local.y / self.line_height) as usize;
+                local.x -= self.row_shift(line, row);
+                return line
+                    .index_for_position(local, self.line_height)
+                    .map(|index| start + index)
+                    .map_err(|index| start + index);
+            }
+            local.y -= height;
+            start += line.len() + 1;
+        }
+        Err(self.len)
     }
 
     fn rows_extent(&self) -> (Pixels, Pixels) {
@@ -612,7 +666,7 @@ impl Inline {
 
     /// Get link at given mouse position.
     fn link_for_position(
-        layout: &TextLayout,
+        layout: &impl SelectionGeometry,
         links: &Vec<(Range<usize>, LinkMark)>,
         position: Point<Pixels>,
     ) -> Option<LinkMark> {
@@ -628,7 +682,7 @@ impl Inline {
 
     /// Get the range of the link at given mouse position.
     fn link_range_for_position(
-        layout: &TextLayout,
+        layout: &impl SelectionGeometry,
         links: &[(Range<usize>, LinkMark)],
         position: Point<Pixels>,
     ) -> Option<Range<usize>> {
@@ -654,7 +708,7 @@ impl Inline {
 
     fn layout_selections(
         &self,
-        text_layout: &TextLayout,
+        text_layout: &impl SelectionGeometry,
         bounds: &Bounds<Pixels>,
         cx: &mut App,
     ) -> (bool, bool, Option<Selection>) {
@@ -766,14 +820,17 @@ impl Inline {
                 .iter()
                 .map(|boundary| layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index)
                 .chain([line.len()]);
-            for row_end in row_ends {
+            for (row_in_line, row_end) in row_ends.enumerate() {
                 let mut width = layout.x_for_index(row_end) - layout.x_for_index(row_start);
                 row_ix += 1;
                 if row_ix < row_count {
                     width += line_height.half();
                 }
-                let bounds = Bounds::new(point(origin.x, y), size(width, line_height))
-                    .intersect(&mask_bounds);
+                let bounds = Bounds::new(
+                    point(origin.x + text_layout.row_shift(line, row_in_line), y),
+                    size(width, line_height),
+                )
+                .intersect(&mask_bounds);
                 if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
                     line_bounds.push(bounds);
                 }
@@ -788,7 +845,7 @@ impl Inline {
     /// touch handles are drawn.
     fn selection_edges(
         selection: &Selection,
-        text_layout: &TextLayout,
+        text_layout: &impl SelectionGeometry,
     ) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
         let (start, end) = (
             selection.start.min(selection.end),
@@ -810,7 +867,7 @@ impl Inline {
     /// Paint the selection background.
     fn paint_selection(
         selection: &Selection,
-        text_layout: &TextLayout,
+        text_layout: &impl SelectionGeometry,
         bounds: &Bounds<Pixels>,
         window: &mut Window,
         color: gpui::Hsla,
@@ -1013,6 +1070,8 @@ impl Element for Inline {
             return;
         }
         let text_layout = self.styled_text.layout().clone();
+        let selection_layout =
+            PaintedSelectionLayout::aligned(&text_layout, window.text_style().text_align);
         if !self.range_backgrounds.is_empty() {
             self.paint_range_highlights(&text_layout, window);
         }
@@ -1020,7 +1079,7 @@ impl Element for Inline {
 
         // layout selections
         let (is_selectable, is_selection, selection) =
-            self.layout_selections(&text_layout, &bounds, cx);
+            self.layout_selections(&selection_layout, &bounds, cx);
 
         let Ok(mut state) = self.state.lock() else {
             _ = text_layout.paint_foreground(window, cx);
@@ -1051,7 +1110,11 @@ impl Element for Inline {
         let hovered_link = hitbox
             .is_hovered(window)
             .then(|| {
-                Self::link_range_for_position(&text_layout, &self.links, window.mouse_position())
+                Self::link_range_for_position(
+                    &selection_layout,
+                    &self.links,
+                    window.mouse_position(),
+                )
             })
             .flatten();
         if hovered_link.is_some() {
@@ -1063,8 +1126,8 @@ impl Element for Inline {
                 .text_view_state()
                 .map(|state| state.read(cx).text_view_style.selection())
                 .unwrap_or_else(|| crate::Theme::global(cx).tokens.colors.selection);
-            Self::paint_selection(selection, &text_layout, &bounds, window, color);
-            if let Some((start, end)) = Self::selection_edges(selection, &text_layout)
+            Self::paint_selection(selection, &selection_layout, &bounds, window, color);
+            if let Some((start, end)) = Self::selection_edges(selection, &selection_layout)
                 && let Some(text_view_state) = GlobalState::global(cx).text_view_state()
             {
                 text_view_state
@@ -1078,7 +1141,7 @@ impl Element for Inline {
 
         if is_selectable {
             if let Some(text_view_state) = GlobalState::global(cx).text_view_state() {
-                let copy_layout = PaintedSelectionLayout::new(&text_layout);
+                let copy_layout = selection_layout.clone();
                 let text_bounds = Self::text_line_bounds(
                     &copy_layout,
                     text_layout.line_height(),
@@ -1109,7 +1172,7 @@ impl Element for Inline {
 
             window.on_mouse_event({
                 let hitbox = hitbox.clone();
-                let text_layout = text_layout.clone();
+                let text_layout = selection_layout.clone();
                 let inline_state = self.state.clone();
                 let text = self.text.clone();
                 let text_view_state = GlobalState::global(cx).text_view_state();
@@ -1190,7 +1253,7 @@ impl Element for Inline {
         if !self.links.is_empty() {
             window.on_mouse_event({
                 let hitbox = hitbox.clone();
-                let text_layout = text_layout.clone();
+                let text_layout = selection_layout.clone();
                 let links = self.links.clone();
                 let mut hovered_link = hovered_link;
                 move |event: &MouseMoveEvent, phase, window, cx| {
@@ -1212,7 +1275,7 @@ impl Element for Inline {
             // click to open link
             window.on_mouse_event({
                 let links = self.links.clone();
-                let text_layout = text_layout.clone();
+                let text_layout = selection_layout.clone();
                 let hitbox = hitbox.clone();
                 let text_view_state = GlobalState::global(cx).text_view_state();
                 let link_click_handler = self.link_click_handler.clone();
@@ -1382,7 +1445,7 @@ fn range_boxes(glyphs: &[GlyphBox], range: Range<usize>) -> Vec<(usize, Pixels, 
 
 fn selection_for_multi_click(
     text: &str,
-    text_layout: &TextLayout,
+    text_layout: &impl SelectionGeometry,
     bounds: Bounds<Pixels>,
     pos: Point<Pixels>,
     kind: TextViewMultiClickKind,
@@ -1405,6 +1468,7 @@ fn selection_for_multi_click(
 }
 
 trait SelectionGeometry {
+    fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize>;
     fn len(&self) -> usize;
     fn line_height(&self) -> Pixels;
     fn rows_extent(&self) -> (Pixels, Pixels);
@@ -1412,6 +1476,9 @@ trait SelectionGeometry {
 }
 
 impl SelectionGeometry for TextLayout {
+    fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
+        TextLayout::index_for_position(self, position)
+    }
     fn len(&self) -> usize {
         TextLayout::len(self)
     }
@@ -1427,6 +1494,9 @@ impl SelectionGeometry for TextLayout {
 }
 
 impl SelectionGeometry for PaintedSelectionLayout {
+    fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
+        self.index_for_position(position)
+    }
     fn len(&self) -> usize {
         self.len
     }
@@ -1877,6 +1947,71 @@ mod range_highlight_tests {
         assert_eq!(highlight[0].2, 1);
         // Three glyphs as wide as the two of "aa" and a half.
         assert_eq!(highlight[0].1, (aa[0].1 - aa[0].0) * 1.5);
+    }
+
+    #[test]
+    fn aligned_shaped_numbers_share_drag_copy_caret_and_hit_geometry() {
+        let mut app = TestApp::with_text_system(Arc::new(WideMonoTextSystem));
+        in_prepaint(&mut app, |window, cx| {
+            let text = "Median\n202";
+            let style = TextStyle {
+                font_family: BODY.into(),
+                font_size: px(16.).into(),
+                ..Default::default()
+            };
+            let styled = StyledText::new(SharedString::from(text)).with_runs(text_runs(
+                text.len(),
+                &style,
+                &[],
+            ));
+            let layout = styled.layout().clone();
+            let mut element = styled.into_any_element();
+            element.layout_as_root(
+                size(
+                    AvailableSpace::Definite(px(100.)),
+                    AvailableSpace::MinContent,
+                ),
+                window,
+                cx,
+            );
+            element.prepaint_at(point(px(7.), px(11.)), window, cx);
+            for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+                let retained = PaintedSelectionLayout::aligned(&layout, align);
+                let glyphs = glyph_boxes(&layout, align, layout.bounds().size.width);
+                let (row, left, right) = range_boxes(&glyphs, 7..10)[0];
+                let start = retained.position_for_index(7).unwrap();
+                let end = retained.position_for_index(10).unwrap();
+                assert_eq!(start.x, layout.bounds().left() + left);
+                assert_eq!(end.x, layout.bounds().left() + right);
+                assert_eq!(
+                    start.y,
+                    layout.bounds().top() + row as f32 * layout.line_height()
+                );
+                let boundary = retained.position_for_index(9).unwrap();
+                let from = point(start.x + px(0.1), start.y + px(1.));
+                let to = point(boundary.x - px(0.1), boundary.y + px(1.));
+                let selected = project_selection(text, &retained, None, from, to).unwrap();
+                assert_eq!(&text[selected.start..selected.end], "20");
+                let reversed = project_selection(text, &retained, None, to, from).unwrap();
+                assert_eq!(&text[reversed.start..reversed.end], "20");
+                assert_eq!(retained.index_for_position(from), Ok(7));
+                assert_eq!(
+                    selection_for_multi_click(
+                        text,
+                        &retained,
+                        layout.bounds(),
+                        from,
+                        TextViewMultiClickKind::Word
+                    ),
+                    Some(7..10)
+                );
+                let (caret, _) = Inline::selection_edges(&Selection::new(7, 9), &retained).unwrap();
+                assert_eq!(caret.left(), start.x);
+                let rows =
+                    Inline::text_line_bounds(&retained, layout.line_height(), layout.bounds());
+                assert_eq!(rows.last().unwrap().left(), start.x);
+            }
+        });
     }
 
     #[test]
